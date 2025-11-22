@@ -1,207 +1,135 @@
-"""
-Tests for decorators.
-"""
-
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from monitoring.decorators import deduplicated
+from app.monitoring.decorators import deduplicated
+
+
+@pytest.fixture
+def mock_redis():
+    """Мок Redis клиента"""
+    with patch("app.monitoring.decorators.get_redis_client") as mock:
+        redis_mock = AsyncMock()
+        redis_mock.set = AsyncMock(return_value=True)
+        mock.return_value = redis_mock
+        yield redis_mock
 
 
 @pytest.mark.asyncio
-async def test_deduplicated_without_redis():
-    """Test deduplicated decorator without Redis adapter"""
-    call_count = 0
-    
-    @deduplicated(key="test_func", ttl=60)
-    async def test_func():
-        nonlocal call_count
-        call_count += 1
-        return "executed"
-    
-    # Without Redis, should execute every time
-    result1 = await test_func()
-    assert result1 == "executed"
-    assert call_count == 1
-    
-    result2 = await test_func()
-    assert result2 == "executed"
-    assert call_count == 2
+class TestDeduplicatedDecorator:
 
+    async def test_first_execution_runs(self, mock_redis):
+        """Первое выполнение проходит"""
+        executed = False
 
-@pytest.mark.asyncio
-async def test_deduplicated_with_redis():
-    """Test deduplicated decorator with Redis adapter"""
-    call_count = 0
-    
-    mock_redis = AsyncMock()
-    
-    # First call: set returns True (key was new)
-    # Second call: set returns False (key exists)
-    mock_redis.set.side_effect = [True, False, False]
-    
-    @deduplicated(key="test_func", ttl=60)
-    async def test_func():
-        nonlocal call_count
-        call_count += 1
-        return "executed"
-    
-    with patch('monitoring.decorators.get_redis_adapter', return_value=mock_redis):
-        # First call should execute
+        @deduplicated(key="test_key", ttl=60)
+        async def test_func():
+            nonlocal executed
+            executed = True
+            return "success"
+
+        result = await test_func()
+
+        assert executed is True
+        assert result == "success"
+        mock_redis.set.assert_called_once()
+
+    async def test_duplicate_execution_skipped(self, mock_redis):
+        """Повторное выполнение пропускается"""
+        execution_count = 0
+
+        @deduplicated(key="test_key", ttl=60)
+        async def test_func():
+            nonlocal execution_count
+            execution_count += 1
+            return "success"
+
+        # Первое выполнение
+        mock_redis.set = AsyncMock(return_value=True)
         result1 = await test_func()
-        assert result1 == "executed"
-        assert call_count == 1
-        
-        # Second call should be deduplicated
+        assert result1 == "success"
+        assert execution_count == 1
+
+        # Второе выполнение - пропускается
+        mock_redis.set = AsyncMock(return_value=False)
         result2 = await test_func()
         assert result2 is None
-        assert call_count == 1  # Should not increment
-        
-        # Third call should also be deduplicated
-        result3 = await test_func()
-        assert result3 is None
-        assert call_count == 1
+        assert execution_count == 1  # Не увеличилось
 
+    async def test_custom_prefix_used(self, mock_redis):
+        """Используется кастомный префикс"""
 
-@pytest.mark.asyncio
-async def test_deduplicated_redis_error_fallback():
-    """Test deduplicated falls back to execution on Redis error"""
-    call_count = 0
-    
-    mock_redis = AsyncMock()
-    mock_redis.set.side_effect = Exception("Redis connection error")
-    
-    @deduplicated(key="test_func", ttl=60)
-    async def test_func():
-        nonlocal call_count
-        call_count += 1
-        return "executed"
-    
-    with patch('monitoring.decorators.get_redis_adapter', return_value=mock_redis):
-        # Should execute despite Redis error
-        result = await test_func()
-        assert result == "executed"
-        assert call_count == 1
+        @deduplicated(key="test", ttl=60, prefix="custom:prefix")
+        async def test_func():
+            return "success"
 
-
-@pytest.mark.asyncio
-async def test_deduplicated_custom_prefix():
-    """Test deduplicated with custom prefix"""
-    mock_redis = AsyncMock()
-    mock_redis.set.return_value = True
-    
-    @deduplicated(key="test_func", ttl=60, prefix="custom_prefix")
-    async def test_func():
-        return "executed"
-    
-    with patch('monitoring.decorators.get_redis_adapter', return_value=mock_redis):
         await test_func()
-        
-        # Check that custom prefix was used
+
         call_args = mock_redis.set.call_args
-        key = call_args[0][0]
-        assert key == "custom_prefix:test_func"
+        used_key = call_args[0][0]
+        assert used_key.startswith("custom:prefix:")
 
+    async def test_ttl_parameter_passed(self, mock_redis):
+        """TTL передается корректно"""
 
-@pytest.mark.asyncio
-async def test_deduplicated_ttl():
-    """Test deduplicated TTL parameter is passed correctly"""
-    mock_redis = AsyncMock()
-    mock_redis.set.return_value = True
-    
-    @deduplicated(key="test_func", ttl=300)
-    async def test_func():
-        return "executed"
-    
-    with patch('monitoring.decorators.get_redis_adapter', return_value=mock_redis):
+        @deduplicated(key="test", ttl=120)
+        async def test_func():
+            return "success"
+
         await test_func()
-        
-        # Check that TTL was passed
-        call_args = mock_redis.set.call_args
-        assert call_args[1]['ex'] == 300
 
+        call_kwargs = mock_redis.set.call_args[1]
+        assert call_kwargs["ex"] == 120
 
-@pytest.mark.asyncio
-async def test_deduplicated_with_arguments():
-    """Test deduplicated decorator with function arguments"""
-    call_count = 0
-    
-    mock_redis = AsyncMock()
-    mock_redis.set.return_value = True
-    
-    @deduplicated(key="test_func", ttl=60)
-    async def test_func(a, b, c=None):
-        nonlocal call_count
-        call_count += 1
-        return f"{a}-{b}-{c}"
-    
-    with patch('monitoring.decorators.get_redis_adapter', return_value=mock_redis):
-        result = await test_func(1, 2, c=3)
-        assert result == "1-2-3"
-        assert call_count == 1
+    async def test_redis_failure_allows_execution(self):
+        """При сбое Redis выполнение разрешается"""
+        with patch("app.monitoring.decorators.get_redis_client") as mock:
+            mock.side_effect = Exception("Redis unavailable")
 
+            executed = False
 
-@pytest.mark.asyncio
-async def test_deduplicated_preserves_function_metadata():
-    """Test deduplicated preserves function name and docstring"""
-    @deduplicated(key="test_func", ttl=60)
-    async def test_func():
-        """Test function docstring"""
-        return "result"
-    
-    assert test_func.__name__ == "test_func"
-    assert test_func.__doc__ == "Test function docstring"
+            @deduplicated(key="test", ttl=60)
+            async def test_func():
+                nonlocal executed
+                executed = True
+                return "success"
 
+            result = await test_func()
 
-@pytest.mark.asyncio
-async def test_deduplicated_with_exception():
-    """Test deduplicated when function raises exception"""
-    call_count = 0
-    
-    mock_redis = AsyncMock()
-    mock_redis.set.return_value = True
-    
-    @deduplicated(key="test_func", ttl=60)
-    async def test_func():
-        nonlocal call_count
-        call_count += 1
-        raise ValueError("Test error")
-    
-    with patch('monitoring.decorators.get_redis_adapter', return_value=mock_redis):
-        # Exception should propagate
-        with pytest.raises(ValueError, match="Test error"):
-            await test_func()
-        
-        assert call_count == 1
+            assert executed is True
+            assert result == "success"
 
+    async def test_preserves_function_metadata(self, mock_redis):
+        """Декоратор сохраняет метаданные функции"""
 
-@pytest.mark.asyncio
-async def test_deduplicated_multiple_functions():
-    """Test deduplicated with multiple functions using different keys"""
-    call_count_1 = 0
-    call_count_2 = 0
-    
-    mock_redis = AsyncMock()
-    # Both functions should execute (both keys are new)
-    mock_redis.set.return_value = True
-    
-    @deduplicated(key="func1", ttl=60)
-    async def func1():
-        nonlocal call_count_1
-        call_count_1 += 1
-        return "func1"
-    
-    @deduplicated(key="func2", ttl=60)
-    async def func2():
-        nonlocal call_count_2
-        call_count_2 += 1
-        return "func2"
-    
-    with patch('monitoring.decorators.get_redis_adapter', return_value=mock_redis):
-        result1 = await func1()
-        result2 = await func2()
-        
-        assert result1 == "func1"
-        assert result2 == "func2"
-        assert call_count_1 == 1
-        assert call_count_2 == 1
+        @deduplicated(key="test", ttl=60)
+        async def test_func():
+            """Test docstring"""
+            return "success"
+
+        assert test_func.__name__ == "test_func"
+        assert test_func.__doc__ == "Test docstring"
+
+    async def test_different_keys_allow_parallel_execution(self, mock_redis):
+        """Разные ключи позволяют параллельное выполнение"""
+        count_a = 0
+        count_b = 0
+
+        @deduplicated(key="key_a", ttl=60)
+        async def func_a():
+            nonlocal count_a
+            count_a += 1
+            return "a"
+
+        @deduplicated(key="key_b", ttl=60)
+        async def func_b():
+            nonlocal count_b
+            count_b += 1
+            return "b"
+
+        mock_redis.set = AsyncMock(return_value=True)
+
+        await func_a()
+        await func_b()
+
+        assert count_a == 1
+        assert count_b == 1

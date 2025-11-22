@@ -1,193 +1,140 @@
-"""
-Integration tests for complete monitoring setup.
-"""
-
 import pytest
-from unittest.mock import AsyncMock, patch
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from unittest.mock import AsyncMock, patch, MagicMock
 
-from monitoring import (
-    setup_monitoring,
-    monitoring_config,
-    set_database_adapter,
-    set_redis_adapter,
-    get_database_adapter,
-    get_redis_adapter,
-)
+from app.monitoring import setup_monitoring, send_startup_notification
+from fastapi import FastAPI
 
 
 @pytest.fixture
-def clean_app():
-    """Create clean FastAPI app"""
-    app = FastAPI()
-    
-    @app.get("/")
-    async def root():
-        return {"status": "ok"}
-    
-    @app.get("/error")
-    async def error():
-        raise ValueError("Test error")
-    
-    return app
+def mock_config():
+    """Мок конфигурации для integration tests"""
+    with patch("app.monitoring.monitoring_config") as mock:
+        mock.MONITORING_ENABLED = True
+        mock.MONITOR_EXCEPTIONS = True
+        mock.TELEGRAM_BOT_TOKEN = "test_token"
+        mock.TELEGRAM_CHAT_ID = "12345"
+        mock.MONITORING_ENV = "test"
+        mock.is_production = False
+        yield mock
 
 
-def test_setup_monitoring_basic(clean_app):
-    """Test basic monitoring setup"""
-    monitoring_config.MONITORING_ENABLED = True
-    monitoring_config.TELEGRAM_BOT_TOKEN = "test_token"
-    monitoring_config.TELEGRAM_CHAT_ID = "test_chat"
-    
-    # Should not raise
-    setup_monitoring(clean_app)
-    
-    # Middleware should be added
-    assert len(clean_app.user_middleware) > 0
+@pytest.fixture
+def mock_telegram():
+    """Мок telegram reporter"""
+    with patch("app.monitoring.telegram_reporter") as mock:
+        mock.send_message = AsyncMock()
+        yield mock
 
 
-def test_setup_monitoring_disabled(clean_app):
-    """Test monitoring setup when disabled"""
-    monitoring_config.MONITORING_ENABLED = False
-    
-    setup_monitoring(clean_app)
-    
-    # No middleware should be added
-    assert len(clean_app.user_middleware) == 0
+class TestMonitoringSetup:
 
+    def test_setup_monitoring_with_valid_config(self, mock_config):
+        """Setup с валидной конфигурацией"""
+        app = FastAPI()
 
-def test_setup_monitoring_missing_config(clean_app):
-    """Test monitoring setup with missing configuration"""
-    monitoring_config.MONITORING_ENABLED = True
-    monitoring_config.TELEGRAM_BOT_TOKEN = None
-    monitoring_config.TELEGRAM_CHAT_ID = None
-    
-    # Should not raise, but should warn
-    setup_monitoring(clean_app)
+        setup_monitoring(app)
 
+        # Проверяем что middleware был добавлен
+        # user_middleware содержит tuple (middleware_class, options)
+        middleware_added = any(
+            (
+                "MonitoringMiddleware" in type(m).__name__
+                if callable(m)
+                else "MonitoringMiddleware" in str(m)
+            )
+            for m in app.user_middleware
+        )
 
-def test_setup_monitoring_with_redis(clean_app):
-    """Test monitoring setup with Redis"""
-    monitoring_config.MONITORING_ENABLED = True
-    monitoring_config.TELEGRAM_BOT_TOKEN = "test_token"
-    monitoring_config.TELEGRAM_CHAT_ID = "test_chat"
-    
-    mock_redis_client = AsyncMock()
-    
-    setup_monitoring(clean_app, redis_client=mock_redis_client)
-    
-    # Redis adapter should be configured
-    redis_adapter = get_redis_adapter()
-    assert redis_adapter is not None
+        assert middleware_added or len(app.user_middleware) > 0
 
+    def test_setup_monitoring_disabled(self):
+        """Setup не добавляет middleware если отключен"""
+        with patch("app.monitoring.monitoring_config") as config:
+            config.MONITORING_ENABLED = False
 
-def test_setup_monitoring_with_adapters(clean_app, mock_database_adapter, mock_queue_adapter):
-    """Test monitoring setup with custom adapters"""
-    monitoring_config.MONITORING_ENABLED = True
-    monitoring_config.TELEGRAM_BOT_TOKEN = "test_token"
-    monitoring_config.TELEGRAM_CHAT_ID = "test_chat"
-    
-    setup_monitoring(
-        clean_app,
-        database_adapter=mock_database_adapter,
-        queue_adapter=mock_queue_adapter
-    )
-    
-    # Adapters should be configured
-    db_adapter = get_database_adapter()
-    assert db_adapter is mock_database_adapter
+            app = FastAPI()
+            setup_monitoring(app)
 
+            # Middleware не должен быть добавлен
+            assert not any(
+                "MonitoringMiddleware" in str(type(m)) for m in app.user_middleware
+            )
 
-@patch('monitoring.telegram_reporter.send_alert')
-def test_full_error_flow(mock_send_alert, clean_app):
-    """Test complete error tracking flow"""
-    mock_send_alert.return_value = True
-    
-    monitoring_config.MONITORING_ENABLED = True
-    monitoring_config.TELEGRAM_BOT_TOKEN = "test_token"
-    monitoring_config.TELEGRAM_CHAT_ID = "test_chat"
-    
-    setup_monitoring(clean_app)
-    
-    client = TestClient(clean_app)
-    
-    # Trigger error
-    response = client.get("/error")
-    assert response.status_code == 500
+    def test_setup_without_telegram_credentials(self):
+        """Setup без Telegram credentials"""
+        with patch("app.monitoring.monitoring_config") as config:
+            config.MONITORING_ENABLED = True
+            config.TELEGRAM_BOT_TOKEN = None
+            config.TELEGRAM_CHAT_ID = "123"
+
+            app = FastAPI()
+            setup_monitoring(app)
+
+            # Middleware не должен быть добавлен без credentials
+            assert not any(
+                "MonitoringMiddleware" in str(type(m)) for m in app.user_middleware
+            )
 
 
 @pytest.mark.asyncio
-async def test_adapter_integration(mock_database_adapter):
-    """Test database adapter integration"""
-    set_database_adapter(mock_database_adapter)
-    
-    db = get_database_adapter()
-    
-    # Should be able to use adapter methods
-    total_users = await db.get_total_users_count()
-    assert total_users == 100
-    
-    health = await db.health_check()
-    assert health is True
+class TestStartupNotification:
+
+    async def test_sends_notification_in_production(self, mock_config, mock_telegram):
+        """Отправляет уведомление в production"""
+        mock_config.is_production = True
+
+        with patch("app.monitoring.decorators.get_redis_client") as redis_mock:
+            redis = AsyncMock()
+            redis.set = AsyncMock(return_value=True)
+            redis_mock.return_value = redis
+
+            await send_startup_notification()
+
+            mock_telegram.send_message.assert_called_once()
+
+    async def test_skips_notification_in_development(self, mock_config, mock_telegram):
+        """Пропускает уведомление в development"""
+        mock_config.is_production = False
+
+        with patch("app.monitoring.decorators.get_redis_client") as redis_mock:
+            redis = AsyncMock()
+            redis.set = AsyncMock(return_value=True)
+            redis_mock.return_value = redis
+
+            await send_startup_notification()
+
+            mock_telegram.send_message.assert_not_called()
+
+    async def test_handles_telegram_failure_gracefully(
+        self, mock_config, mock_telegram
+    ):
+        """Обрабатывает ошибку Telegram без падения"""
+        mock_config.is_production = True
+        mock_telegram.send_message = AsyncMock(side_effect=Exception("Telegram error"))
+
+        with patch("app.monitoring.decorators.get_redis_client") as redis_mock:
+            redis = AsyncMock()
+            redis.set = AsyncMock(return_value=True)
+            redis_mock.return_value = redis
+
+            # Не должно выбросить исключение
+            await send_startup_notification()
 
 
-def test_multiple_setup_calls(clean_app):
-    """Test that multiple setup_monitoring calls don't break things"""
-    monitoring_config.MONITORING_ENABLED = True
-    monitoring_config.TELEGRAM_BOT_TOKEN = "test_token"
-    monitoring_config.TELEGRAM_CHAT_ID = "test_chat"
-    
-    setup_monitoring(clean_app)
-    middleware_count_1 = len(clean_app.user_middleware)
-    
-    setup_monitoring(clean_app)
-    middleware_count_2 = len(clean_app.user_middleware)
-    
-    # Should add middleware each time
-    assert middleware_count_2 == middleware_count_1 * 2
+class TestMonitoringModuleExports:
 
+    def test_all_exports_available(self):
+        """Проверка что все экспорты доступны"""
+        from app.monitoring import (
+            setup_monitoring,
+            monitoring_config,
+            telegram_reporter,
+            monitored_task,
+            monitored_periodic_task,
+        )
 
-def test_monitoring_in_production_mode(clean_app):
-    """Test monitoring behavior in production"""
-    monitoring_config.MONITORING_ENABLED = True
-    monitoring_config.MONITORING_ENV = "production"
-    monitoring_config.TELEGRAM_BOT_TOKEN = "test_token"
-    monitoring_config.TELEGRAM_CHAT_ID = "test_chat"
-    
-    setup_monitoring(clean_app)
-    
-    assert monitoring_config.is_production is True
-
-
-def test_monitoring_in_development_mode(clean_app):
-    """Test monitoring behavior in development"""
-    monitoring_config.MONITORING_ENABLED = True
-    monitoring_config.MONITORING_ENV = "development"
-    monitoring_config.TELEGRAM_BOT_TOKEN = "test_token"
-    monitoring_config.TELEGRAM_CHAT_ID = "test_chat"
-    
-    setup_monitoring(clean_app)
-    
-    assert monitoring_config.is_production is False
-
-
-@pytest.mark.asyncio
-async def test_redis_adapter_integration():
-    """Test Redis adapter integration"""
-    mock_redis_client = AsyncMock()
-    mock_redis_client.ping.return_value = True
-    
-    from monitoring.adapters import DefaultRedisAdapter
-    
-    adapter = DefaultRedisAdapter(mock_redis_client)
-    set_redis_adapter(adapter)
-    
-    redis = get_redis_adapter()
-    assert redis is not None
-    
-    # Test basic operations
-    await redis.set("test_key", "test_value")
-    mock_redis_client.set.assert_called_once()
-    
-    health = await redis.ping()
-    assert health is True
+        assert callable(setup_monitoring)
+        assert monitoring_config is not None
+        assert telegram_reporter is not None
+        assert callable(monitored_task)
+        assert callable(monitored_periodic_task)
